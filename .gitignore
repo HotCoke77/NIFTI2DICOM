@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+.env
+.venv/
+venv/
+
+# macOS
+.DS_Store
+.AppleDouble
+
+# IDE
+.vscode/
+.idea/
+
+# Data files (avoid accidentally committing patient data)
+*.nii
+*.nii.gz
+*.dcm
