@@ -21,11 +21,11 @@ def nifti_to_dicom(nifti_file, dicom_template_dir, output_dicom_dir, sequence_nu
     nifti_img = nib.load(nifti_file)
     nifti_data = nifti_img.get_fdata()
     nifti_data = normalize_to_max(nifti_data)
+    affine = nifti_img.affine
     print(f"NIfTI intensity range after normalization: min={nifti_data.min()}, max={nifti_data.max()}")
 
     os.makedirs(output_dicom_dir, exist_ok=True)
 
-    # Accept DICOM files regardless of extension
     all_files = [os.path.join(dicom_template_dir, f)
                  for f in os.listdir(dicom_template_dir)
                  if os.path.isfile(os.path.join(dicom_template_dir, f))]
@@ -34,29 +34,48 @@ def nifti_to_dicom(nifti_file, dicom_template_dir, output_dicom_dir, sequence_nu
     if not dicom_files:
         raise ValueError(f"No DICOM files found in {dicom_template_dir}")
 
-    # Sort by InstanceNumber to guarantee correct anatomical slice ordering
-    dicom_files.sort(key=lambda f: int(pydicom.dcmread(f, stop_before_pixels=True).InstanceNumber))
+    # Map orientation to the relevant ImagePositionPatient axis and NIfTI voxel dimension.
+    # DICOM uses LPS coordinates; NIfTI uses RAS.
+    # z (superior) has the same sign in both; x and y are negated between the two conventions.
+    if orientation == 'axial':
+        dicom_axis = 2       # LPS z = RAS z (same sign)
+        nifti_dim  = 2
+        nifti_sign = float(affine[2, 2])
+    elif orientation == 'sagittal':
+        dicom_axis = 0       # LPS x = left; RAS x = right (opposite sign)
+        nifti_dim  = 0
+        nifti_sign = -float(affine[0, 0])
+    elif orientation == 'coronal':
+        dicom_axis = 1       # LPS y = posterior; RAS y = anterior (opposite sign)
+        nifti_dim  = 1
+        nifti_sign = -float(affine[1, 1])
+    else:
+        raise ValueError(f"Invalid orientation '{orientation}': must be axial, sagittal, or coronal")
+
+    # Sort DICOM by ascending patient position along the slice axis
+    dicom_files.sort(key=lambda f: float(pydicom.dcmread(f, stop_before_pixels=True).ImagePositionPatient[dicom_axis]))
+
+    n_slices = nifti_data.shape[nifti_dim]
+    if len(dicom_files) != n_slices:
+        raise ValueError(f"Slice count mismatch ({orientation}): {len(dicom_files)} DICOM vs {n_slices} NIfTI")
+
+    # If the NIfTI slice direction opposes the ascending DICOM position order, reverse the index
+    nifti_reversed = nifti_sign < 0
+    print(f"NIfTI slice order: {'reversed' if nifti_reversed else 'matched'} relative to DICOM position order")
 
     new_series_instance_uid = generate_uid()
-
-    if orientation == 'axial' and len(dicom_files) != nifti_data.shape[2]:
-        raise ValueError(f"Slice count mismatch (axial): {len(dicom_files)} DICOM vs {nifti_data.shape[2]} NIfTI")
-    elif orientation == 'sagittal' and len(dicom_files) != nifti_data.shape[0]:
-        raise ValueError(f"Slice count mismatch (sagittal): {len(dicom_files)} DICOM vs {nifti_data.shape[0]} NIfTI")
-    elif orientation == 'coronal' and len(dicom_files) != nifti_data.shape[1]:
-        raise ValueError(f"Slice count mismatch (coronal): {len(dicom_files)} DICOM vs {nifti_data.shape[1]} NIfTI")
 
     for i, dicom_file in enumerate(dicom_files):
         dicom_template = pydicom.dcmread(dicom_file)
 
+        nifti_idx = (n_slices - 1 - i) if nifti_reversed else i
+
         if orientation == 'axial':
-            nifti_slice = nifti_data[:, :, i]
+            nifti_slice = nifti_data[:, :, nifti_idx]
         elif orientation == 'sagittal':
-            nifti_slice = nifti_data[i, :, :]
-        elif orientation == 'coronal':
-            nifti_slice = nifti_data[:, i, :]
-        else:
-            raise ValueError(f"Invalid orientation '{orientation}': must be axial, sagittal, or coronal")
+            nifti_slice = nifti_data[nifti_idx, :, :]
+        else:  # coronal
+            nifti_slice = nifti_data[:, nifti_idx, :]
 
         # NOTE: This transform is validated for axial orientation.
         # Verify visually if using sagittal or coronal — the correct rotation
@@ -70,6 +89,7 @@ def nifti_to_dicom(nifti_file, dicom_template_dir, output_dicom_dir, sequence_nu
         dicom_template.PixelData = nifti_slice.astype(np.uint16).tobytes()
 
         dicom_template.SeriesNumber = sequence_number
+        dicom_template.InstanceNumber = i + 1      # reassign sequentially in z-sort order
         dicom_template.SeriesDescription = sequence_description
         dicom_template.ProtocolName = sequence_description
         dicom_template.SeriesInstanceUID = new_series_instance_uid
@@ -81,12 +101,7 @@ def nifti_to_dicom(nifti_file, dicom_template_dir, output_dicom_dir, sequence_nu
         dicom_template.HighBit = 11
         dicom_template.PixelRepresentation = 0
 
-        base_name = os.path.basename(dicom_file)
-        name_parts = base_name.split('-')
-        if len(name_parts) > 3:
-            new_name = f"{name_parts[0]}-{sequence_number}-{name_parts[2]}"
-        else:
-            new_name = f"IM-{sequence_number}-{base_name[-9:]}"
+        new_name = f"IM-{sequence_number}-{str(i + 1).zfill(4)}.dcm"
 
         output_file = os.path.join(output_dicom_dir, new_name)
         dicom_template.save_as(output_file)
@@ -112,7 +127,7 @@ if __name__ == "__main__":
 
     if len(sys.argv) < 7:
         print("Error: 6 arguments required.")
-        print("Usage: python Nifti_To_DICOM.py <nifti> <dicom_dir> <out_dir> <orientation> <seq_num> <seq_desc>")
+        print("Usage: python NIFTI2DICOM.py <nifti> <dicom_dir> <out_dir> <orientation> <seq_num> <seq_desc>")
         sys.exit(1)
 
     nifti_file = sys.argv[1]
